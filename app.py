@@ -72,6 +72,103 @@ def load_data() -> pd.DataFrame:
     return df
 
 
+# ── Bradley-Terry ─────────────────────────────────────────────────────────────
+
+def _bt_players_for_gender(
+    rows: list,
+    alpha: float,
+    max_iter: int,
+    tol: float,
+) -> dict:
+    """
+    Bradley-Terry at PLAYER level via MM algorithm.
+    Each row is (p1a, p1b, p2a, p2b, won) — four players, pair 1 vs pair 2.
+    A win for pair 1 counts as a win for both p1a and p1b against both p2a and p2b.
+    Returns {player_name -> log_strength}, normalized so geometric mean = 0.
+    """
+    wins: dict = defaultdict(float)
+    n_mat: dict = defaultdict(lambda: defaultdict(float))
+
+    for p1a, p1b, p2a, p2b, won in rows:
+        team1 = [p1a, p1b]
+        team2 = [p2a, p2b]
+        for pi in team1:
+            for pj in team2:
+                wins[pi] += float(won)
+                wins[pj] += float(not won)
+                n_mat[pi][pj] += 1.0
+                n_mat[pj][pi] += 1.0
+
+    players = sorted(wins.keys())
+    NEU = "__neutral__"
+    for p in players:
+        wins[p] += alpha
+        wins[NEU] += alpha
+        n_mat[p][NEU] += alpha
+        n_mat[NEU][p] += alpha
+
+    all_keys = players + [NEU]
+    s = {p: 1.0 for p in all_keys}
+
+    for _ in range(max_iter):
+        ns = {}
+        for i in all_keys:
+            w_i = wins[i]
+            denom = sum(
+                n_mat[i][j] / (s[i] + s[j])
+                for j in n_mat[i] if n_mat[i][j] > 0
+            )
+            ns[i] = (w_i / denom) if denom > 0 and w_i > 0 else 1e-9
+        log_mean = float(np.mean([np.log(v) for v in ns.values() if v > 1e-10]))
+        scale = np.exp(log_mean)
+        ns = {p: v / scale for p, v in ns.items()}
+        delta = max(abs(ns[p] - s[p]) for p in all_keys)
+        s = ns
+        if delta < tol:
+            break
+
+    return {p: float(np.log(s[p])) for p in players}
+
+
+def _compute_bt(
+    df: pd.DataFrame,
+    alpha: float = 2.0,
+    max_iter: int = 500,
+    tol: float = 1e-8,
+) -> dict:
+    """
+    Bradley-Terry player strengths via MM algorithm, per the book's MLE approach.
+    P(pair_i beats pair_j) = 1 / (1 + exp(-(mean_log_s_i - mean_log_s_j)))
+    Computed separately for Men and Women to avoid cross-gender contamination.
+    All matches (including qualifiers) used — qualifiers connect through shared players
+    and create the full strength calibration chain.
+    alpha: Laplace-smoothing regularization against neutral baseline.
+    Returns {player_name -> log_strength}, normalized so geometric mean = 0.
+    Unknown players default to log_strength=0 at prediction time.
+    """
+    men_rows: list = []
+    women_rows: list = []
+
+    for _, r in df.iterrows():
+        cat = str(r.get("category", "")).strip()
+        won = (r["winner"] == 1)
+        row = (r["t1_p1"], r["t1_p2"], r["t2_p1"], r["t2_p2"], won)
+        if cat.startswith("Women"):
+            women_rows.append(row)
+        else:
+            men_rows.append(row)
+
+    bt_men   = _bt_players_for_gender(men_rows,   alpha, max_iter, tol)
+    bt_women = _bt_players_for_gender(women_rows, alpha, max_iter, tol)
+    return {**bt_men, **bt_women}
+
+
+def _pair_bt(player_bt: dict, pair: list[str]) -> float:
+    """Pair BT log-strength = mean of player log-strengths (geometric mean in linear scale)."""
+    vals = [player_bt.get(p, 0.0) for p in pair]
+    return float(np.mean(vals))
+
+
 # ── Elo + tilastojen laskenta ─────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
@@ -79,8 +176,11 @@ def compute_all(df: pd.DataFrame):
     """
     Käy ottelut kronologisesti läpi. Joka ottelulle kirjataan
     PRE-match Elo ja rolling-tilastot (featureiksi mallille).
+    Bradley-Terry lasketaan koko datasta (parikohtainen vahvuus).
     Ottelun jälkeen päivitetään Elo ja tilastohistoria.
     """
+    bt_log = _compute_bt(df)
+
     elo: dict[str, float] = defaultdict(lambda: INIT_ELO)
     p_srv: dict[str, list[float]] = defaultdict(list)
     p_ret: dict[str, list[float]] = defaultdict(list)
@@ -101,10 +201,12 @@ def compute_all(df: pd.DataFrame):
         e1, e2 = team_elo(t1), team_elo(t2)
         s1, s2 = team_stat(t1, p_srv), team_stat(t2, p_srv)
         rv1, rv2 = team_stat(t1, p_ret), team_stat(t2, p_ret)
+        bt_diff = _pair_bt(bt_log, t1) - _pair_bt(bt_log, t2)
 
         feat_rows.append(
             dict(
                 elo_diff=e1 - e2,
+                bt_diff=bt_diff,
                 srv_diff=0.0 if (np.isnan(s1) or np.isnan(s2)) else s1 - s2,
                 ret_diff=0.0 if (np.isnan(rv1) or np.isnan(rv2)) else rv1 - rv2,
                 winner=r["winner"],
@@ -131,14 +233,14 @@ def compute_all(df: pd.DataFrame):
                     p_ret[p].append(float(rv))
 
     feat_df = pd.DataFrame(feat_rows)
-    return feat_df, dict(elo), dict(p_srv), dict(p_ret)
+    return feat_df, dict(elo), dict(p_srv), dict(p_ret), bt_log
 
 
 # ── Mallin koulutus ───────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
 def train_model(feat_df: pd.DataFrame):
-    X = feat_df[["elo_diff", "srv_diff", "ret_diff"]].fillna(0.0).values
+    X = feat_df[["elo_diff", "bt_diff", "srv_diff", "ret_diff"]].fillna(0.0).values
     y = (feat_df["winner"] == 1).astype(int).values
 
     scaler = StandardScaler()
@@ -159,9 +261,10 @@ def predict(
     elo: dict,
     p_srv: dict,
     p_ret: dict,
+    bt_log: dict,
     clf: LogisticRegression,
     scaler: StandardScaler,
-) -> tuple[float, float, dict]:
+) -> tuple[float, float, float, dict]:
 
     def pe(pl: list[str]) -> float:
         return float(np.mean([elo.get(p, INIT_ELO) for p in pl]))
@@ -174,19 +277,25 @@ def predict(
     s1, s2 = ps(pair1, p_srv), ps(pair2, p_srv)
     r1, r2 = ps(pair1, p_ret), ps(pair2, p_ret)
 
+    bt1 = _pair_bt(bt_log, pair1)
+    bt2 = _pair_bt(bt_log, pair2)
+    bt_diff = bt1 - bt2
+    bt_prob = float(1.0 / (1.0 + np.exp(-bt_diff)))
+
     elo_diff = e1 - e2
     srv_diff = (s1 - s2) if (s1 is not None and s2 is not None) else 0.0
     ret_diff = (r1 - r2) if (r1 is not None and r2 is not None) else 0.0
 
-    X = np.array([[elo_diff, srv_diff, ret_diff]])
-    model_prob = float(clf.predict_proba(scaler.transform(X))[0][1])
+    X = np.array([[elo_diff, bt_diff, srv_diff, ret_diff]])
+    ensemble_prob = float(clf.predict_proba(scaler.transform(X))[0][1])
     elo_prob = 1.0 / (1.0 + 10.0 ** ((e2 - e1) / 400.0))
 
     details = dict(
         e1=e1, e2=e2, s1=s1, s2=s2, r1=r1, r2=r2,
-        elo_diff=elo_diff, srv_diff=srv_diff, ret_diff=ret_diff,
+        bt1=bt1, bt2=bt2,
+        elo_diff=elo_diff, bt_diff=bt_diff, srv_diff=srv_diff, ret_diff=ret_diff,
     )
-    return model_prob, elo_prob, details
+    return ensemble_prob, elo_prob, bt_prob, details
 
 
 # ── H2H-haku ─────────────────────────────────────────────────────────────────
@@ -467,7 +576,7 @@ st.set_page_config(page_title="Premier Padel Vetomalli", page_icon="🎾", layou
 # Ladataan data (aina tarvitaan)
 with st.spinner("Ladataan data ja lasketaan ratingit…"):
     df = load_data()
-    feat_df, elo, p_srv, p_ret = compute_all(df)
+    feat_df, elo, p_srv, p_ret, bt_log = compute_all(df)
     clf, scaler, acc = train_model(feat_df)
 
 match_counts: dict[str, int] = defaultdict(int)
@@ -595,21 +704,32 @@ elif page == "🎾 Vetomalli":
     # Lasketaan ennuste
     pair1 = [p1_a, p1_b]
     pair2 = [p2_a, p2_b]
-    model_prob, elo_prob, d = predict(pair1, pair2, elo, p_srv, p_ret, clf, scaler)
+    ensemble_prob, elo_prob, bt_prob, d = predict(
+        pair1, pair2, elo, p_srv, p_ret, bt_log, clf, scaler
+    )
     h2h_w1, h2h_w2 = head_to_head(df, pair1, pair2)
     total_h2h = h2h_w1 + h2h_w2
     name1 = f"{p1_a} / {p1_b}"
     name2 = f"{p2_a} / {p2_b}"
+
+    # BT-vahvuus rankina (exp(log_strength), suurempi = vahvempi)
+    bt_sorted_pairs = sorted(bt_log.items(), key=lambda x: x[1], reverse=True)
+    bt_rank = {p: i + 1 for i, (p, _) in enumerate(bt_sorted_pairs)}
+    n_players = len(bt_log)
 
     # Tiimikortit
     st.divider()
     col_t1, col_vs, col_t2 = st.columns([5, 1, 5])
     with col_t1:
         st.subheader(name1)
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Elo (tiimi)", f"{d['e1']:.0f}")
-        c2.metric("Serve %", fmt_pct(d["s1"]))
-        c3.metric("Return %", fmt_pct(d["r1"]))
+        avg_rank1 = int(round(np.mean([bt_rank.get(p, n_players) for p in pair1])))
+        c2.metric("BT-vahvuus", f"{np.exp(d['bt1']):.2f}",
+                  help="Bradley-Terry vahvuusparametri. >1 = vahvempi kuin keskiarvo.")
+        c2.caption(f"Rank #{avg_rank1}/{n_players} (keskim.)")
+        c3.metric("Serve %", fmt_pct(d["s1"]))
+        c4.metric("Return %", fmt_pct(d["r1"]))
     with col_vs:
         st.markdown("<br><br><h3 style='text-align:center'>vs</h3>", unsafe_allow_html=True)
         if total_h2h:
@@ -619,10 +739,14 @@ elif page == "🎾 Vetomalli":
             )
     with col_t2:
         st.subheader(name2)
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.metric("Elo (tiimi)", f"{d['e2']:.0f}")
-        c2.metric("Serve %", fmt_pct(d["s2"]))
-        c3.metric("Return %", fmt_pct(d["r2"]))
+        avg_rank2 = int(round(np.mean([bt_rank.get(p, n_players) for p in pair2])))
+        c2.metric("BT-vahvuus", f"{np.exp(d['bt2']):.2f}",
+                  help="Bradley-Terry vahvuusparametri. >1 = vahvempi kuin keskiarvo.")
+        c2.caption(f"Rank #{avg_rank2}/{n_players} (keskim.)")
+        c3.metric("Serve %", fmt_pct(d["s2"]))
+        c4.metric("Return %", fmt_pct(d["r2"]))
 
     st.divider()
 
@@ -630,16 +754,17 @@ elif page == "🎾 Vetomalli":
     st.subheader("Voittotodennäköisyydet")
     prob_col1, prob_col2 = st.columns(2)
 
-    fair  = 1.0 / model_prob      if model_prob > 0 else 999.0
-    fair2 = 1.0 / (1 - model_prob) if model_prob < 1 else 999.0
-    edge  = (model_prob * bookie_odds - 1.0) * 100
+    fair  = 1.0 / ensemble_prob      if ensemble_prob > 0 else 999.0
+    fair2 = 1.0 / (1 - ensemble_prob) if ensemble_prob < 1 else 999.0
+    edge  = (ensemble_prob * bookie_odds - 1.0) * 100
 
     with prob_col1:
         st.markdown(f"**{name1}**")
-        st.progress(model_prob, text=f"Malli: {model_prob * 100:.1f} %")
-        m1, m2 = st.columns(2)
-        m1.metric("Malli ML%", f"{model_prob * 100:.1f} %")
-        m2.metric("Elo ML%",   f"{elo_prob * 100:.1f} %")
+        st.progress(ensemble_prob, text=f"Ensemble: {ensemble_prob * 100:.1f} %")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Ensemble", f"{ensemble_prob * 100:.1f} %")
+        m2.metric("Bradley-Terry", f"{bt_prob * 100:.1f} %")
+        m3.metric("Elo",     f"{elo_prob * 100:.1f} %")
         st.markdown("---")
         e1c, e2c = st.columns(2)
         e1c.metric("Fair kerroin", f"{fair:.2f}")
@@ -650,22 +775,26 @@ elif page == "🎾 Vetomalli":
         )
     with prob_col2:
         st.markdown(f"**{name2}**")
-        st.progress(1 - model_prob, text=f"Malli: {(1 - model_prob) * 100:.1f} %")
-        m1, m2 = st.columns(2)
-        m1.metric("Malli ML%", f"{(1 - model_prob) * 100:.1f} %")
-        m2.metric("Elo ML%",   f"{(1 - elo_prob) * 100:.1f} %")
+        st.progress(1 - ensemble_prob, text=f"Ensemble: {(1 - ensemble_prob) * 100:.1f} %")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Ensemble", f"{(1 - ensemble_prob) * 100:.1f} %")
+        m2.metric("Bradley-Terry", f"{(1 - bt_prob) * 100:.1f} %")
+        m3.metric("Elo",     f"{(1 - elo_prob) * 100:.1f} %")
         st.markdown("---")
         st.metric("Fair kerroin", f"{fair2:.2f}")
 
     # Tarkempi analyysi
     with st.expander("🔍 Tarkempi analyysi"):
-        fc1, fc2, fc3 = st.columns(3)
+        fc1, fc2, fc3, fc4 = st.columns(4)
         fc1.metric("Elo-ero (P1 − P2)", f"{d['elo_diff']:+.0f}")
-        fc2.metric("Serve-ero",  f"{d['srv_diff'] * 100:+.1f} pp" if d["srv_diff"] else "Ei dataa")
-        fc3.metric("Return-ero", f"{d['ret_diff'] * 100:+.1f} pp" if d["ret_diff"] else "Ei dataa")
+        fc2.metric("BT log-ero",
+                   f"{d['bt_diff']:+.3f}",
+                   help="log(λ₁) − log(λ₂). Positiivinen = Pari 1 vahvempi BT:n mukaan.")
+        fc3.metric("Serve-ero",  f"{d['srv_diff'] * 100:+.1f} pp" if d["srv_diff"] else "Ei dataa")
+        fc4.metric("Return-ero", f"{d['ret_diff'] * 100:+.1f} pp" if d["ret_diff"] else "Ei dataa")
 
         st.markdown("#### Mallin kertoimet (standardoidut)")
-        coefs = dict(zip(["Elo-ero", "Serve-ero", "Return-ero"], clf.coef_[0]))
+        coefs = dict(zip(["Elo-ero", "BT log-ero", "Serve-ero", "Return-ero"], clf.coef_[0]))
         st.dataframe(
             pd.DataFrame([{"Feature": k, "Kerroin": f"{v:.3f}"} for k, v in coefs.items()]),
             hide_index=True, use_container_width=False,
