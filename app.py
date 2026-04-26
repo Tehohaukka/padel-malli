@@ -336,73 +336,73 @@ def fetch_upcoming_tournaments() -> list[dict]:
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_tournament_matches(tournament_id: str, slug: str) -> list[dict]:
     """
-    Yrittää hakea turnauksen otteluohjelman API:sta.
-    Kokeilee useita tunnettuja endpoint-nimiä. Palauttaa tyhjän listan jos epäonnistuu.
+    Hakee turnauksen otteluohjelman kahdella API-kutsulla:
+      1. gettournamentsdate(slug)  →  turnauksen päivät
+      2. gettournamentsmatchlistnew(tournaments_id, date, draw_type)  ×  päivät × Men/Women
+    Palauttaa tulevat + meneillään olevat ottelut.
     """
-    for endpoint, payload in [
-        ("/premierpadel/api/beforeauth/getfantournamentmatches",
-         {"tournament_id": tournament_id, "page": "", "pagesize": "-1"}),
-        ("/premierpadel/api/beforeauth/getfanapptournamentmatches",
-         {"tournament_id": tournament_id, "pagesize": "-1"}),
-        ("/premierpadel/api/beforeauth/getmatches",
-         {"tournament_id": tournament_id, "pagesize": "-1"}),
-        ("/premierpadel/api/beforeauth/gettournamentmatches",
-         {"tournaments_id": tournament_id}),
-    ]:
-        try:
-            result = _pp_post(endpoint, **payload)
-            data = result.get("data", [])
-            if not isinstance(data, list) or not data:
+    # Vaihe 1: turnauksen päivät
+    try:
+        date_resp = _pp_post(
+            "/premierpadel/api/beforeauth/gettournamentsdate",
+            slug=slug, lang="en",
+        )
+        all_dates = [d["date"] for d in date_resp.get("data", [])]
+    except Exception:
+        return []
+
+    if not all_dates:
+        return []
+
+    today = _dt.now().strftime("%Y-%m-%d")
+    fetch_dates = [d for d in all_dates if d >= today] or all_dates[-2:]
+
+    # Vaihe 2: ottelut per päivä per sukupuoli
+    matches: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for date in fetch_dates:
+        for gender in ("Men", "Women"):
+            try:
+                resp = _pp_post(
+                    "/premierpadel/api/beforeauth/gettournamentsmatchlistnew",
+                    tournaments_id=tournament_id,
+                    date=date,
+                    draw_type=gender,
+                    lang="en",
+                )
+                bucket = resp.get("data", {})
+                is_live = str(resp.get("is_live_match", "")).lower() == "yes"
+                raw = (
+                    bucket.get("main_draw",    []) +
+                    bucket.get("qualify_draw", []) +
+                    bucket.get("live",         []) +
+                    bucket.get("upcoming",     [])
+                )
+                for m in raw:
+                    mid = str(m.get("tournaments_match_id", ""))
+                    if not mid or mid in seen_ids:
+                        continue
+                    seen_ids.add(mid)
+                    # Ohita jo valmistuneet
+                    if m.get("status") == "F" and str(m.get("winner_id", "")) in ("1", "2"):
+                        continue
+                    matches.append({
+                        "match_id":   mid,
+                        "round":      m.get("round_name", ""),
+                        "date":       m.get("date", date),
+                        "start_time": m.get("start_time", ""),
+                        "court":      m.get("court_name", ""),
+                        "t1_p1":      m.get("team1_player_name", ""),
+                        "t1_p2":      m.get("team1_partner_name", ""),
+                        "t2_p1":      m.get("team2_player_name", ""),
+                        "t2_p2":      m.get("team2_partner_player_name", ""),
+                        "live":       is_live or m.get("status") == "L",
+                    })
+            except Exception:
                 continue
 
-            matches: list[dict] = []
-            for m in data:
-                def _pname(obj) -> str:
-                    if isinstance(obj, dict):
-                        return obj.get("player_name", obj.get("name", obj.get("full_name", "")))
-                    return str(obj) if obj else ""
-
-                t1 = m.get("team1_players", m.get("team1", []))
-                t2 = m.get("team2_players", m.get("team2", []))
-                matches.append({
-                    "match_id": str(m.get("match_id", m.get("id", ""))),
-                    "round":    m.get("round_name", m.get("round", m.get("phase", ""))),
-                    "category": m.get("category", m.get("gender", "")),
-                    "date":     m.get("match_date", m.get("date", m.get("start_date", ""))),
-                    "t1_p1":    _pname(t1[0]) if isinstance(t1, list) and len(t1) > 0 else _pname(t1),
-                    "t1_p2":    _pname(t1[1]) if isinstance(t1, list) and len(t1) > 1 else "",
-                    "t2_p1":    _pname(t2[0]) if isinstance(t2, list) and len(t2) > 0 else _pname(t2),
-                    "t2_p2":    _pname(t2[1]) if isinstance(t2, list) and len(t2) > 1 else "",
-                })
-            if matches:
-                return matches
-        except Exception:
-            continue
-
-    # Fallback: yritä hakea schedule-sivu suoralla HTTP-pyynnöllä
-    for path in [
-        f"/en/tournaments-schedule/{slug}/schedule",
-        f"/en/tournaments/{slug}/schedule",
-        f"/en/tournaments-results/{slug}/results",
-    ]:
-        try:
-            resp = _requests.get(_PP_BASE + path, headers=_PP_HEADERS, timeout=15)
-            if resp.status_code != 200:
-                continue
-            soup = _BS(resp.text, "html.parser")
-            ids: list[str] = []
-            for a in soup.find_all("a", href=True):
-                m = re.search(r"/matchstats/(\d+)", a["href"])
-                if m and m.group(1) not in ids:
-                    ids.append(m.group(1))
-            if ids:
-                return [{"match_id": mid, "round": "", "category": "",
-                         "date": "", "t1_p1": "", "t1_p2": "", "t2_p1": "", "t2_p2": ""}
-                        for mid in ids]
-        except Exception:
-            continue
-
-    return []
+    return matches
 
 
 def _fuzzy_player(name: str, pool: list[str]) -> str:
@@ -535,20 +535,19 @@ if page == "📅 Otteluohjelma":
         for cat, cat_matches in by_cat.items():
             st.markdown(f"**{cat}**")
             for m in cat_matches:
-                has_players = m["t1_p1"] or m["t2_p1"]
+                t1_str = f"{m['t1_p1']} / {m['t1_p2']}" if m["t1_p2"] else m["t1_p1"]
+                t2_str = f"{m['t2_p1']} / {m['t2_p2']}" if m["t2_p2"] else m["t2_p1"]
+                live_badge = " 🔴 LIVE" if m.get("live") else ""
+
                 col_match, col_info, col_btn = st.columns([5, 3, 2])
+                col_match.markdown(f"**{t1_str}** vs **{t2_str}**{live_badge}")
 
-                if has_players:
-                    t1_str = f"{m['t1_p1']} / {m['t1_p2']}" if m["t1_p2"] else m["t1_p1"]
-                    t2_str = f"{m['t2_p1']} / {m['t2_p2']}" if m["t2_p2"] else m["t2_p1"]
-                    col_match.markdown(f"**{t1_str}** vs **{t2_str}**")
-                else:
-                    col_match.markdown(f"Ottelu #{m['match_id']}")
+                time_str = m.get("start_time", "")
+                court_str = m.get("court", "")
+                meta_parts = [p for p in [m.get("date",""), time_str, court_str] if p]
+                col_info.caption(" · ".join(meta_parts) or "—")
 
-                meta = " · ".join(x for x in [m.get("round", ""), m.get("date", "")] if x)
-                col_info.caption(meta or "—")
-
-                if has_players and col_btn.button("🎾 Analysoi", key=f"sched_{m['match_id']}"):
+                if col_btn.button("🎾 Analysoi", key=f"sched_{m['match_id']}"):
                     st.session_state["p1a_q"] = _fuzzy_player(m["t1_p1"], elo_sorted)
                     st.session_state["p1b_q"] = _fuzzy_player(m["t1_p2"], elo_sorted)
                     st.session_state["p2a_q"] = _fuzzy_player(m["t2_p1"], elo_sorted)
