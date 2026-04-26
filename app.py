@@ -10,10 +10,13 @@ import os
 import re
 import warnings
 from collections import defaultdict
+from datetime import datetime as _dt
 
 import numpy as np
 import pandas as pd
+import requests as _requests
 import streamlit as st
+from bs4 import BeautifulSoup as _BS
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
@@ -266,6 +269,161 @@ def delete_bet(bet_id: int) -> None:
     save_history(df[df["id"] != bet_id].reset_index(drop=True))
 
 
+# ── Otteluohjelma: Premier Padel API ────────────────────────────────────────
+
+_PP_BASE = "https://premierpadel.com"
+_PP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": _PP_BASE + "/en/tournaments",
+    "Accept":  "application/json, */*",
+}
+_MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+
+def _pp_post(path: str, **form_data) -> dict:
+    r = _requests.post(
+        _PP_BASE + path,
+        data={k: str(v) for k, v in form_data.items()},
+        headers=_PP_HEADERS,
+        timeout=12,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_upcoming_tournaments() -> list[dict]:
+    """Hakee tulevat / käynnissä olevat turnaukset (nykyinen + 2 seuraavaa kuukautta)."""
+    now = _dt.now()
+    found: list[dict] = []
+    seen: set[str] = set()
+    for delta in range(3):
+        total_month = now.month - 1 + delta
+        year  = now.year + total_month // 12
+        month = _MONTH_NAMES[total_month % 12]
+        try:
+            result = _pp_post(
+                "/premierpadel/api/beforeauth/getfanapptournaments",
+                page="", pagesize="-1", month_name=month, year=str(year),
+            )
+            for t in result.get("data", []):
+                slug   = t.get("slug", "")
+                status = t.get("tournaments_type", "")
+                if not slug or slug in seen:
+                    continue
+                if status not in ("Upcoming", "Live", "Active", "Current"):
+                    continue
+                seen.add(slug)
+                found.append({
+                    "name":   t.get("full_name", slug),
+                    "slug":   slug,
+                    "id":     str(t.get("tournaments_id", "")),
+                    "start":  t.get("start_date", ""),
+                    "end":    t.get("end_date", ""),
+                    "status": status,
+                })
+        except Exception:
+            continue
+    return found
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_tournament_matches(tournament_id: str, slug: str) -> list[dict]:
+    """
+    Yrittää hakea turnauksen otteluohjelman API:sta.
+    Kokeilee useita tunnettuja endpoint-nimiä. Palauttaa tyhjän listan jos epäonnistuu.
+    """
+    for endpoint, payload in [
+        ("/premierpadel/api/beforeauth/getfantournamentmatches",
+         {"tournament_id": tournament_id, "page": "", "pagesize": "-1"}),
+        ("/premierpadel/api/beforeauth/getfanapptournamentmatches",
+         {"tournament_id": tournament_id, "pagesize": "-1"}),
+        ("/premierpadel/api/beforeauth/getmatches",
+         {"tournament_id": tournament_id, "pagesize": "-1"}),
+        ("/premierpadel/api/beforeauth/gettournamentmatches",
+         {"tournaments_id": tournament_id}),
+    ]:
+        try:
+            result = _pp_post(endpoint, **payload)
+            data = result.get("data", [])
+            if not isinstance(data, list) or not data:
+                continue
+
+            matches: list[dict] = []
+            for m in data:
+                def _pname(obj) -> str:
+                    if isinstance(obj, dict):
+                        return obj.get("player_name", obj.get("name", obj.get("full_name", "")))
+                    return str(obj) if obj else ""
+
+                t1 = m.get("team1_players", m.get("team1", []))
+                t2 = m.get("team2_players", m.get("team2", []))
+                matches.append({
+                    "match_id": str(m.get("match_id", m.get("id", ""))),
+                    "round":    m.get("round_name", m.get("round", m.get("phase", ""))),
+                    "category": m.get("category", m.get("gender", "")),
+                    "date":     m.get("match_date", m.get("date", m.get("start_date", ""))),
+                    "t1_p1":    _pname(t1[0]) if isinstance(t1, list) and len(t1) > 0 else _pname(t1),
+                    "t1_p2":    _pname(t1[1]) if isinstance(t1, list) and len(t1) > 1 else "",
+                    "t2_p1":    _pname(t2[0]) if isinstance(t2, list) and len(t2) > 0 else _pname(t2),
+                    "t2_p2":    _pname(t2[1]) if isinstance(t2, list) and len(t2) > 1 else "",
+                })
+            if matches:
+                return matches
+        except Exception:
+            continue
+
+    # Fallback: yritä hakea schedule-sivu suoralla HTTP-pyynnöllä
+    for path in [
+        f"/en/tournaments-schedule/{slug}/schedule",
+        f"/en/tournaments/{slug}/schedule",
+        f"/en/tournaments-results/{slug}/results",
+    ]:
+        try:
+            resp = _requests.get(_PP_BASE + path, headers=_PP_HEADERS, timeout=15)
+            if resp.status_code != 200:
+                continue
+            soup = _BS(resp.text, "html.parser")
+            ids: list[str] = []
+            for a in soup.find_all("a", href=True):
+                m = re.search(r"/matchstats/(\d+)", a["href"])
+                if m and m.group(1) not in ids:
+                    ids.append(m.group(1))
+            if ids:
+                return [{"match_id": mid, "round": "", "category": "",
+                         "date": "", "t1_p1": "", "t1_p2": "", "t2_p1": "", "t2_p2": ""}
+                        for mid in ids]
+        except Exception:
+            continue
+
+    return []
+
+
+def _fuzzy_player(name: str, pool: list[str]) -> str:
+    """Löytää lähimmän pelaajan nimen tietokannasta."""
+    if not name or not pool:
+        return pool[0] if pool else ""
+    name_l = name.strip().lower()
+    # 1) Tarkka substring
+    for p in pool:
+        if name_l in p.lower() or p.lower() in name_l:
+            return p
+    # 2) Sukunimi-haku (viimeinen sana)
+    last = name_l.split()[-1] if name_l.split() else name_l
+    for p in pool:
+        if last in p.lower():
+            return p
+    # 3) Fuzzy
+    hits = difflib.get_close_matches(name, pool, n=1, cutoff=0.3)
+    return hits[0] if hits else pool[0]
+
+
 # ── Pelaajahaku ──────────────────────────────────────────────────────────────
 
 def player_picker(label: str, key: str, pool: list[str], exclude: set[str]) -> str:
@@ -321,18 +479,90 @@ elo_sorted  = sorted(all_players, key=lambda p: elo.get(p, INIT_ELO), reverse=Tr
 
 # ── Sivunavigointi ────────────────────────────────────────────────────────────
 
+_PAGES = ["📅 Otteluohjelma", "🎾 Vetomalli", "📋 Vetohistoria"]
+if "nav" not in st.session_state:
+    st.session_state["nav"] = "🎾 Vetomalli"
+
 page = st.sidebar.radio(
     "Sivu",
-    ["🎾 Vetomalli", "📋 Vetohistoria"],
+    _PAGES,
+    key="nav",
     label_visibility="collapsed",
 )
 st.sidebar.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SIVU 1 — VETOMALLI
+#  SIVU 1 — OTTELUOHJELMA
 # ═══════════════════════════════════════════════════════════════════════════════
 
-if page == "🎾 Vetomalli":
+if page == "📅 Otteluohjelma":
+
+    st.title("📅 Otteluohjelma")
+    st.caption("Tulevat Premier Padel -ottelut · Päivitetään 30 min välein")
+
+    if st.button("🔄 Päivitä"):
+        st.cache_data.clear()
+        st.rerun()
+
+    with st.spinner("Haetaan turnaukset…"):
+        tournaments = fetch_upcoming_tournaments()
+
+    if not tournaments:
+        st.info(
+            "Ei tulevia turnauksia juuri nyt. "
+            "Premierpadel.com saattaa olla tilapäisesti poissa tai turnauksia ei ole "
+            "lähiviikkoina."
+        )
+        st.stop()
+
+    for t in tournaments:
+        st.subheader(f"🏆 {t['name']}")
+        st.caption(f"{t['start']} – {t['end']}  ·  {t['status']}")
+
+        with st.spinner(f"Haetaan {t['name']} ottelut…"):
+            matches = fetch_tournament_matches(t["id"], t["slug"])
+
+        if not matches:
+            st.info("Otteluohjelma ei ole vielä saatavilla tälle turnaukselle.")
+            st.divider()
+            continue
+
+        # Ryhmittele kategorian mukaan
+        by_cat: dict[str, list[dict]] = defaultdict(list)
+        for m in matches:
+            by_cat[m.get("category") or "—"].append(m)
+
+        for cat, cat_matches in by_cat.items():
+            st.markdown(f"**{cat}**")
+            for m in cat_matches:
+                has_players = m["t1_p1"] or m["t2_p1"]
+                col_match, col_info, col_btn = st.columns([5, 3, 2])
+
+                if has_players:
+                    t1_str = f"{m['t1_p1']} / {m['t1_p2']}" if m["t1_p2"] else m["t1_p1"]
+                    t2_str = f"{m['t2_p1']} / {m['t2_p2']}" if m["t2_p2"] else m["t2_p1"]
+                    col_match.markdown(f"**{t1_str}** vs **{t2_str}**")
+                else:
+                    col_match.markdown(f"Ottelu #{m['match_id']}")
+
+                meta = " · ".join(x for x in [m.get("round", ""), m.get("date", "")] if x)
+                col_info.caption(meta or "—")
+
+                if has_players and col_btn.button("🎾 Analysoi", key=f"sched_{m['match_id']}"):
+                    st.session_state["p1a_q"] = _fuzzy_player(m["t1_p1"], elo_sorted)
+                    st.session_state["p1b_q"] = _fuzzy_player(m["t1_p2"], elo_sorted)
+                    st.session_state["p2a_q"] = _fuzzy_player(m["t2_p1"], elo_sorted)
+                    st.session_state["p2b_q"] = _fuzzy_player(m["t2_p2"], elo_sorted)
+                    st.session_state["nav"] = "🎾 Vetomalli"
+                    st.rerun()
+
+        st.divider()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SIVU 2 — VETOMALLI
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif page == "🎾 Vetomalli":
 
     st.title("🎾 Premier Padel — Vetomalli")
 
@@ -482,7 +712,7 @@ if page == "🎾 Vetomalli":
                 st.success("Veto tallennettu!")
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  SIVU 2 — VETOHISTORIA
+#  SIVU 3 — VETOHISTORIA
 # ═══════════════════════════════════════════════════════════════════════════════
 
 elif page == "📋 Vetohistoria":
