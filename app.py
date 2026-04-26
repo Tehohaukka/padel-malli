@@ -479,16 +479,21 @@ elo_sorted  = sorted(all_players, key=lambda p: elo.get(p, INIT_ELO), reverse=Tr
 
 # ── Sivunavigointi ────────────────────────────────────────────────────────────
 
-_PAGES = ["📅 Otteluohjelma", "🎾 Vetomalli", "📋 Vetohistoria"]
-if "nav" not in st.session_state:
-    st.session_state["nav"] = "🎾 Vetomalli"
+_PAGES    = ["📅 Otteluohjelma", "🎾 Vetomalli", "📋 Vetohistoria"]
+_PAGE_KEY = {"otteluohjelma": 0, "vetomalli": 1, "vetohistoria": 2}
+_PAGE_QP  = {0: "otteluohjelma", 1: "vetomalli", 2: "vetohistoria"}
+
+_qp       = st.query_params.get("page", "vetomalli")
+_page_idx = _PAGE_KEY.get(_qp, 1)
 
 page = st.sidebar.radio(
     "Sivu",
     _PAGES,
-    key="nav",
+    index=_page_idx,
     label_visibility="collapsed",
 )
+# Pidä query param URL synkronoituna manuaaliseen valintaan
+st.query_params["page"] = _PAGE_QP[_PAGES.index(page)]
 st.sidebar.divider()
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -552,7 +557,7 @@ if page == "📅 Otteluohjelma":
                     st.session_state["p1b_q"] = _fuzzy_player(m["t1_p2"], elo_sorted)
                     st.session_state["p2a_q"] = _fuzzy_player(m["t2_p1"], elo_sorted)
                     st.session_state["p2b_q"] = _fuzzy_player(m["t2_p2"], elo_sorted)
-                    st.session_state["nav"] = "🎾 Vetomalli"
+                    st.query_params["page"] = "vetomalli"
                     st.rerun()
 
         st.divider()
